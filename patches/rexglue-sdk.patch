@@ -1,0 +1,1293 @@
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index d9a64eb..41b64fb 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -17,7 +17,7 @@ set(REXGLUE_INSTALL_TARGETS
+     rexgpu-xenos
+     disruptorplus renderdoc simde tomlplusplus
+     aes128 mspack o1heap disasm xxhash
+-    libavcodec libavutil
++    libavformat libavcodec libavutil
+ )
+ 
+ if(REXGLUE_USE_VULKAN)
+diff --git a/include/rex/audio/audio_system.h b/include/rex/audio/audio_system.h
+index 33fd32c..0cf6591 100644
+--- a/include/rex/audio/audio_system.h
++++ b/include/rex/audio/audio_system.h
+@@ -31,6 +31,7 @@ namespace rex::audio {
+ constexpr memory::fourcc_t kAudioSaveSignature = memory::make_fourcc("XAUD");
+ 
+ class AudioDriver;
++class MediaPlayer;
+ class XmaDecoder;
+ 
+ class AudioSystem : public system::IAudioSystem {
+@@ -40,6 +41,11 @@ class AudioSystem : public system::IAudioSystem {
+   memory::Memory* memory() const { return memory_; }
+   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_; }
+   XmaDecoder* xma_decoder() const { return xma_decoder_.get(); }
++  MediaPlayer* media_player() const { return media_player_.get(); }
++
++  // XMPCaptureOutput: the title receives the music player's output one XAudio
++  // frame at a time (guest callback(samples_ptr, context)) and mixes it itself.
++  void SetMusicCapture(uint32_t callback, uint32_t context);
+ 
+   virtual X_STATUS Setup(system::KernelState* kernel_state);
+   virtual void Shutdown();
+@@ -61,6 +67,7 @@ class AudioSystem : public system::IAudioSystem {
+   virtual void Initialize();
+ 
+   void WorkerThreadMain();
++  void PumpMusicCapture();
+ 
+   virtual X_STATUS CreateDriver(size_t index, rex::thread::Semaphore* semaphore,
+                                 AudioDriver** out_driver) = 0;
+@@ -71,6 +78,14 @@ class AudioSystem : public system::IAudioSystem {
+   memory::Memory* memory_ = nullptr;
+   runtime::FunctionDispatcher* function_dispatcher_ = nullptr;
+   std::unique_ptr<XmaDecoder> xma_decoder_;
++  std::unique_ptr<MediaPlayer> media_player_;
++  std::atomic<uint32_t> music_capture_callback_ = {0};
++  std::atomic<uint32_t> music_capture_context_ = {0};
++  // Packets handed to the title stay referenced until its voice has played
++  // them, so frames rotate through a ring of guest buffers.
++  static constexpr uint32_t kMusicCaptureBuffers = 64;
++  uint32_t music_capture_buffers_ = 0;
++  uint32_t music_capture_index_ = 0;
+   uint32_t queued_frames_;
+ 
+   std::atomic<bool> worker_running_ = {false};
+diff --git a/include/rex/audio/media_player.h b/include/rex/audio/media_player.h
+new file mode 100644
+index 0000000..9ef53e9
+--- /dev/null
++++ b/include/rex/audio/media_player.h
+@@ -0,0 +1,78 @@
++/**
++ * @file        audio/media_player.h
++ * @brief       WMA/MP3 playback for the XMP (Xbox Music Player) title playlists
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the root for more details.
++ */
++
++#pragma once
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++struct SDL_AudioStream;
++
++namespace rex::audio {
++
++// Decodes one song at a time on its own thread. The output is 48 kHz stereo
++// float and goes either to the host audio device or, when a title captures
++// the XMP output (XMPCaptureOutput), to ReadFrame() in XAudio-sized frames.
++class MediaPlayer {
++ public:
++  static constexpr uint32_t kSampleRate = 48000;
++  static constexpr uint32_t kChannels = 2;
++  static constexpr uint32_t kFrameSamples = 256;  // one XAudio render frame
++
++  MediaPlayer();
++  ~MediaPlayer();
++
++  // Starts decoding `data` (a whole WMA/MP3 file), replacing the current song.
++  // `on_finished` runs on the decoder thread once the song has played out; it
++  // may call Play() again.
++  void Play(std::vector<uint8_t> data, std::function<void()> on_finished);
++  void Stop();
++  void Pause();
++  void Resume();
++  void SetVolume(float volume);
++
++  // Captured output is handed out through ReadFrame instead of the device.
++  void SetCaptured(bool captured);
++  bool is_captured() const { return captured_; }
++
++  // Fills `out` with kFrameSamples * kChannels interleaved samples. Returns
++  // false when there is nothing to play (idle, paused or still buffering).
++  bool ReadFrame(float* out);
++
++ private:
++  struct Track {
++    std::vector<uint8_t> data;
++    std::function<void()> on_finished;
++  };
++
++  void ThreadMain();
++  void Decode(const Track& track, uint64_t generation);
++  bool Cancelled(uint64_t generation) const { return generation_ != generation; }
++  SDL_AudioStream* Sink();
++
++  std::thread thread_;
++  std::mutex mutex_;
++  std::condition_variable cv_;
++  std::unique_ptr<Track> pending_;
++  std::atomic<uint64_t> generation_{0};
++  std::atomic<bool> quit_{false};
++  std::atomic<bool> paused_{false};
++  std::atomic<bool> captured_{false};
++  std::atomic<float> volume_{1.0f};
++
++  SDL_AudioStream* capture_stream_ = nullptr;  // resampler feeding ReadFrame
++  SDL_AudioStream* device_stream_ = nullptr;   // direct playback
++};
++
++}  // namespace rex::audio
+diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
+index d939d62..848d97a 100644
+--- a/include/rex/kernel/xam/apps/xmp_app.h
++++ b/include/rex/kernel/xam/apps/xmp_app.h
+@@ -39,12 +39,14 @@ class XmpApp : public system::xam::App {
+     kTitle = 1,
+   };
+   enum class PlaybackMode : uint32_t {
+-    // kInOrder = ?,
+-    kUnknown = 0,
++    kInOrder = 0,
++    kShuffle = 1,
++    kUnknown = kInOrder,
+   };
+   enum class RepeatMode : uint32_t {
+-    // kNoRepeat = ?,
+-    kUnknown = 0,
++    kPlaylist = 0,
++    kNoRepeat = 1,
++    kUnknown = kPlaylist,
+   };
+   struct Song {
+     enum class Format : uint32_t {
+@@ -95,6 +97,11 @@ class XmpApp : public system::xam::App {
+   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
+ 
+   void OnStateChanged();
++  // Starts the active playlist's current song. Requires the global lock.
++  void PlayActiveSong();
++  // Picks the song after the current one; false at the end of the playlist.
++  bool AdvanceSong();
++  void OnSongFinished(uint64_t play_id);
+ 
+   State state_;
+   PlaybackClient playback_client_;
+@@ -104,6 +111,9 @@ class XmpApp : public system::xam::App {
+   float volume_;
+   Playlist* active_playlist_;
+   int active_song_index_;
++  // Songs of the active playlist already played (for shuffle).
++  std::vector<bool> played_;
++  uint64_t play_id_ = 0;
+ 
+   rex::thread::global_critical_region global_critical_region_;
+   std::unordered_map<uint32_t, Playlist*> playlists_;
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 0ede542..d98fd3a 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -138,6 +138,10 @@ union alignas(0x10) VRegister {
+ // Floating-Point Status and Control Register (FPSCR)
+ //=============================================================================
+ 
++#ifdef REX_DEBUG_FP_TRAP
++extern "C" volatile int rex_debug_fp_trap;  // defined by the title
++#endif
++
+ constexpr uint32_t kRoundNearest = 0x00;
+ constexpr uint32_t kRoundTowardZero = 0x01;
+ constexpr uint32_t kRoundUp = 0x02;
+@@ -158,7 +162,20 @@ struct FPSCRRegister {
+   static constexpr uint32_t GuestMask = uint32_t(RoundMaskVal) | uint32_t(FlushMask);
+ 
+   inline uint32_t getcsr() noexcept { return Platform::getcsr(); }
+-  inline void setcsr(uint32_t csr) noexcept { Platform::setcsr(csr); }
++  // Contexts created for host threads (audio worker, interrupts) never run InitHost, so their
++  // cached csr starts at 0; writing it as-is would unmask every host FP exception.
++  inline void setcsr(uint32_t value) noexcept {
++    Platform::InitHostExceptions(value);
++#ifdef REX_DEBUG_FP_TRAP
++    // Debug builds of a title can unmask the invalid-operation exception to
++    // find where a NaN is first produced (x86 MXCSR IM, bit 7).
++    if (rex_debug_fp_trap) {
++      value &= ~0x80u;
++    }
++#endif
++    csr = value;
++    Platform::setcsr(value);
++  }
+ 
+   // Restoring the whole word would unmask every FP exception when csr is 0.
+   inline void restoreGuestBits(uint32_t saved) noexcept {
+diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
+index d55f16a..6a9b3c3 100644
+--- a/src/audio/CMakeLists.txt
++++ b/src/audio/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_library(rexaudio OBJECT
+     audio_driver.cpp
+     audio_system.cpp
+     downmix.cpp
++    media_player.cpp
+     xma_context.cpp
+     xma_decoder.cpp
+     xma_register_file.cpp
+@@ -37,5 +38,5 @@ target_include_directories(rexaudio PUBLIC
+ 
+ target_link_libraries(rexaudio
+     PUBLIC rexcore SDL3::SDL3
+-    PRIVATE libavcodec libavutil
++    PRIVATE libavformat libavcodec libavutil
+ )
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 7a711a8..8695897 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -13,6 +13,7 @@
+ #include <rex/audio/audio_driver.h>
+ #include <rex/audio/audio_system.h>
+ #include <rex/audio/flags.h>
++#include <rex/audio/media_player.h>
+ #include <rex/audio/xma/decoder.h>
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+@@ -66,6 +67,7 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
+   wait_handles_[kMaximumClientCount] = shutdown_event_.get();
+ 
+   xma_decoder_ = std::make_unique<rex::audio::XmaDecoder>(function_dispatcher_);
++  media_player_ = std::make_unique<MediaPlayer>();
+ 
+   resume_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+   assert_not_null(resume_event_);
+@@ -140,6 +142,7 @@ void AudioSystem::WorkerThreadMain() {
+       global_lock.unlock();
+ 
+       if (client_callback) {
++        PumpMusicCapture();
+         if (diag_pump_count < 10) {
+           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
+                        client_callback, client_callback_arg, index);
+@@ -173,6 +176,39 @@ void AudioSystem::WorkerThreadMain() {
+   // TODO(benvanik): call module API to kill?
+ }
+ 
++void AudioSystem::SetMusicCapture(uint32_t callback, uint32_t context) {
++  music_capture_context_ = context;
++  music_capture_callback_ = callback;
++  media_player_->SetCaptured(callback != 0);
++}
++
++// Runs on the worker right before a client renders a frame, so the title gets
++// exactly one frame of music per frame it mixes.
++void AudioSystem::PumpMusicCapture() {
++  uint32_t callback = music_capture_callback_;
++  if (!callback) {
++    return;
++  }
++  constexpr uint32_t kSamples = MediaPlayer::kFrameSamples * MediaPlayer::kChannels;
++  float frame[kSamples];
++  if (!media_player_->ReadFrame(frame)) {
++    return;
++  }
++  if (!music_capture_buffers_) {
++    music_capture_buffers_ =
++        memory()->SystemHeapAlloc(kMusicCaptureBuffers * kSamples * sizeof(float));
++  }
++  uint32_t buffer = music_capture_buffers_ + music_capture_index_ * kSamples * sizeof(float);
++  music_capture_index_ = (music_capture_index_ + 1) % kMusicCaptureBuffers;
++  auto* dest = memory()->TranslateVirtual<rex::be<float>*>(buffer);
++  for (uint32_t i = 0; i < kSamples; ++i) {
++    dest[i] = frame[i];
++  }
++  uint64_t args[] = {buffer, music_capture_context_.load()};
++  function_dispatcher_->Execute(worker_thread_->thread_state(), callback, args,
++                                rex::countof(args));
++}
++
+ int AudioSystem::FindFreeClient() {
+   for (size_t i = 0; i < kMaximumClientCount; i++) {
+     auto& client = clients_[i];
+@@ -191,6 +227,11 @@ void AudioSystem::Shutdown() {
+     return;
+   }
+ 
++  music_capture_callback_ = 0;
++  if (media_player_) {
++    media_player_->Stop();
++  }
++
+   // Shut down XMA decoder first - its worker can stall in FFmpeg
+   if (xma_decoder_) {
+     xma_decoder_->Shutdown();
+diff --git a/src/audio/media_player.cpp b/src/audio/media_player.cpp
+new file mode 100644
+index 0000000..f440261
+--- /dev/null
++++ b/src/audio/media_player.cpp
+@@ -0,0 +1,345 @@
++/**
++ * @file        audio/media_player.cpp
++ * @brief       WMA/MP3 playback for the XMP (Xbox Music Player) title playlists
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the root for more details.
++ */
++
++#include <rex/audio/media_player.h>
++
++#include <algorithm>
++#include <chrono>
++#include <cstring>
++
++#include <SDL3/SDL.h>
++
++#include <rex/logging.h>
++
++extern "C" {
++#include <libavcodec/avcodec.h>
++#include <libavformat/avformat.h>
++}
++
++namespace rex::audio {
++
++namespace {
++
++constexpr int kFrameBytes =
++    MediaPlayer::kFrameSamples * MediaPlayer::kChannels * int(sizeof(float));
++// Decode ahead by about a quarter of a second.
++constexpr int kBufferedBytes = MediaPlayer::kSampleRate / 4 * MediaPlayer::kChannels * 4;
++
++struct MemoryReader {
++  const uint8_t* data;
++  int64_t size;
++  int64_t pos;
++};
++
++int ReadPacket(void* opaque, uint8_t* buf, int buf_size) {
++  auto* r = static_cast<MemoryReader*>(opaque);
++  int64_t n = std::min<int64_t>(buf_size, r->size - r->pos);
++  if (n <= 0) {
++    return AVERROR_EOF;
++  }
++  std::memcpy(buf, r->data + r->pos, size_t(n));
++  r->pos += n;
++  return int(n);
++}
++
++int64_t Seek(void* opaque, int64_t offset, int whence) {
++  auto* r = static_cast<MemoryReader*>(opaque);
++  switch (whence & ~AVSEEK_FORCE) {
++    case AVSEEK_SIZE:
++      return r->size;
++    case SEEK_SET:
++      r->pos = offset;
++      break;
++    case SEEK_CUR:
++      r->pos += offset;
++      break;
++    case SEEK_END:
++      r->pos = r->size + offset;
++      break;
++    default:
++      return -1;
++  }
++  r->pos = std::clamp<int64_t>(r->pos, 0, r->size);
++  return r->pos;
++}
++
++// Any decoder sample layout -> interleaved stereo float.
++void ToStereoFloat(const AVFrame* frame, std::vector<float>& out) {
++  int n = frame->nb_samples, ch = frame->channels;
++  out.resize(size_t(n) * 2);
++  auto sample = [&](int c, int i) -> float {
++    switch (frame->format) {
++      case AV_SAMPLE_FMT_FLTP:
++        return reinterpret_cast<const float*>(frame->extended_data[c])[i];
++      case AV_SAMPLE_FMT_FLT:
++        return reinterpret_cast<const float*>(frame->extended_data[0])[i * ch + c];
++      case AV_SAMPLE_FMT_S16P:
++        return reinterpret_cast<const int16_t*>(frame->extended_data[c])[i] / 32768.0f;
++      case AV_SAMPLE_FMT_S16:
++        return reinterpret_cast<const int16_t*>(frame->extended_data[0])[i * ch + c] / 32768.0f;
++      default:
++        return 0.0f;
++    }
++  };
++  for (int i = 0; i < n; ++i) {
++    out[size_t(i) * 2] = sample(0, i);
++    out[size_t(i) * 2 + 1] = sample(ch > 1 ? 1 : 0, i);
++  }
++}
++
++}  // namespace
++
++MediaPlayer::MediaPlayer() {
++  if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
++    REXAPU_ERROR("MediaPlayer: SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
++  }
++  SDL_AudioSpec spec = {SDL_AUDIO_F32, int(kChannels), int(kSampleRate)};
++  capture_stream_ = SDL_CreateAudioStream(&spec, &spec);
++  thread_ = std::thread([this] { ThreadMain(); });
++}
++
++MediaPlayer::~MediaPlayer() {
++  quit_ = true;
++  ++generation_;
++  cv_.notify_all();
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++  if (device_stream_) {
++    SDL_DestroyAudioStream(device_stream_);
++  }
++  if (capture_stream_) {
++    SDL_DestroyAudioStream(capture_stream_);
++  }
++  SDL_QuitSubSystem(SDL_INIT_AUDIO);
++}
++
++void MediaPlayer::Play(std::vector<uint8_t> data, std::function<void()> on_finished) {
++  {
++    std::lock_guard lock(mutex_);
++    pending_ = std::make_unique<Track>(Track{std::move(data), std::move(on_finished)});
++    ++generation_;
++    paused_ = false;
++  }
++  cv_.notify_all();
++}
++
++void MediaPlayer::Stop() {
++  std::lock_guard lock(mutex_);
++  pending_.reset();
++  ++generation_;
++  if (capture_stream_) {
++    SDL_ClearAudioStream(capture_stream_);
++  }
++  if (device_stream_) {
++    SDL_ClearAudioStream(device_stream_);
++  }
++}
++
++void MediaPlayer::Pause() {
++  paused_ = true;
++  if (device_stream_) {
++    SDL_PauseAudioStreamDevice(device_stream_);
++  }
++}
++
++void MediaPlayer::Resume() {
++  paused_ = false;
++  if (device_stream_) {
++    SDL_ResumeAudioStreamDevice(device_stream_);
++  }
++}
++
++void MediaPlayer::SetVolume(float volume) {
++  volume_ = volume;
++  if (device_stream_) {
++    SDL_SetAudioStreamGain(device_stream_, volume);
++  }
++}
++
++void MediaPlayer::SetCaptured(bool captured) {
++  captured_ = captured;
++  if (captured && device_stream_) {
++    SDL_ClearAudioStream(device_stream_);
++  }
++}
++
++bool MediaPlayer::ReadFrame(float* out) {
++  if (!captured_ || paused_ || !capture_stream_ ||
++      SDL_GetAudioStreamAvailable(capture_stream_) < kFrameBytes) {
++    return false;
++  }
++  return SDL_GetAudioStreamData(capture_stream_, out, kFrameBytes) == kFrameBytes;
++}
++
++SDL_AudioStream* MediaPlayer::Sink() {
++  if (captured_) {
++    return capture_stream_;
++  }
++  if (!device_stream_) {
++    SDL_AudioSpec spec = {SDL_AUDIO_F32, int(kChannels), int(kSampleRate)};
++    device_stream_ =
++        SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
++    if (!device_stream_) {
++      REXAPU_ERROR("MediaPlayer: SDL_OpenAudioDeviceStream failed: {}", SDL_GetError());
++      return nullptr;
++    }
++    SDL_SetAudioStreamGain(device_stream_, volume_);
++    if (!paused_) {
++      SDL_ResumeAudioStreamDevice(device_stream_);
++    }
++  }
++  return device_stream_;
++}
++
++void MediaPlayer::ThreadMain() {
++  while (!quit_) {
++    std::unique_ptr<Track> track;
++    uint64_t generation;
++    {
++      std::unique_lock lock(mutex_);
++      cv_.wait(lock, [this] { return quit_ || pending_; });
++      if (quit_) {
++        break;
++      }
++      track = std::move(pending_);
++      generation = generation_;
++      if (capture_stream_) {
++        SDL_ClearAudioStream(capture_stream_);
++      }
++      if (device_stream_) {
++        SDL_ClearAudioStream(device_stream_);
++      }
++    }
++    Decode(*track, generation);
++    if (!Cancelled(generation) && track->on_finished) {
++      track->on_finished();
++    }
++  }
++}
++
++void MediaPlayer::Decode(const Track& track, uint64_t generation) {
++  MemoryReader reader{track.data.data(), int64_t(track.data.size()), 0};
++  constexpr int kIoBufferSize = 32 * 1024;
++  auto* io_buffer = static_cast<uint8_t*>(av_malloc(kIoBufferSize));
++  AVIOContext* io =
++      avio_alloc_context(io_buffer, kIoBufferSize, 0, &reader, ReadPacket, nullptr, Seek);
++  AVFormatContext* format = avformat_alloc_context();
++  format->pb = io;
++  AVCodecContext* codec_ctx = nullptr;
++  AVPacket* packet = av_packet_alloc();
++  AVFrame* frame = av_frame_alloc();
++  std::vector<float> samples;
++  int stream_index = -1;
++  bool opened = false;
++  auto sleep = [] { std::this_thread::sleep_for(std::chrono::milliseconds(5)); };
++
++  do {
++    if (avformat_open_input(&format, nullptr, nullptr, nullptr) < 0) {
++      REXAPU_ERROR("MediaPlayer: unrecognized media file ({} bytes)", track.data.size());
++      break;
++    }
++    if (avformat_find_stream_info(format, nullptr) < 0) {
++      REXAPU_ERROR("MediaPlayer: no stream info");
++      break;
++    }
++    for (unsigned i = 0; i < format->nb_streams; ++i) {
++      if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
++        stream_index = int(i);
++        break;
++      }
++    }
++    if (stream_index < 0) {
++      REXAPU_ERROR("MediaPlayer: no audio stream");
++      break;
++    }
++    const AVCodecParameters* par = format->streams[stream_index]->codecpar;
++    const AVCodec* codec = avcodec_find_decoder(par->codec_id);
++    if (!codec) {
++      REXAPU_ERROR("MediaPlayer: no decoder for codec id {}", int(par->codec_id));
++      break;
++    }
++    codec_ctx = avcodec_alloc_context3(codec);
++    avcodec_parameters_to_context(codec_ctx, par);
++    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
++      REXAPU_ERROR("MediaPlayer: failed to open decoder {}", codec->name);
++      break;
++    }
++    REXAPU_INFO("MediaPlayer: playing {} {} Hz {} ch", codec->name, par->sample_rate,
++                par->channels);
++    opened = true;
++
++    int input_rate = 0;
++    bool eof = false;
++    while (!eof && !Cancelled(generation)) {
++      SDL_AudioStream* sink = Sink();
++      if (!sink) {
++        break;
++      }
++      // Throttle: stay a little ahead of the consumer.
++      int buffered = sink == capture_stream_ ? SDL_GetAudioStreamAvailable(sink)
++                                             : SDL_GetAudioStreamQueued(sink);
++      if (buffered > kBufferedBytes) {
++        sleep();
++        continue;
++      }
++      if (av_read_frame(format, packet) < 0) {
++        eof = true;
++        avcodec_send_packet(codec_ctx, nullptr);
++      } else {
++        if (packet->stream_index == stream_index) {
++          avcodec_send_packet(codec_ctx, packet);
++        }
++        av_packet_unref(packet);
++      }
++      while (avcodec_receive_frame(codec_ctx, frame) == 0) {
++        if (frame->sample_rate != input_rate) {
++          input_rate = frame->sample_rate;
++          SDL_AudioSpec src = {SDL_AUDIO_F32, int(kChannels), input_rate};
++          SDL_SetAudioStreamFormat(sink, &src, nullptr);
++        }
++        ToStereoFloat(frame, samples);
++        SDL_PutAudioStreamData(sink, samples.data(), int(samples.size() * sizeof(float)));
++        av_frame_unref(frame);
++      }
++    }
++
++    // Let what is buffered play out before reporting the end of the song.
++    if (!Cancelled(generation)) {
++      SDL_AudioStream* sink = Sink();
++      if (sink) {
++        SDL_FlushAudioStream(sink);
++        while (!Cancelled(generation) && !quit_) {
++          int left = sink == capture_stream_ ? SDL_GetAudioStreamAvailable(sink)
++                                             : SDL_GetAudioStreamQueued(sink);
++          if (left < kFrameBytes) {
++            break;
++          }
++          sleep();
++        }
++      }
++    }
++  } while (false);
++  if (!opened) {
++    // Keep a playlist of undecodable files from spinning.
++    std::this_thread::sleep_for(std::chrono::milliseconds(200));
++  }
++
++  av_frame_free(&frame);
++  av_packet_free(&packet);
++  if (codec_ctx) {
++    avcodec_free_context(&codec_ctx);
++  }
++  avformat_close_input(&format);
++  if (io) {
++    av_freep(&io->buffer);
++    avio_context_free(&io);
++  }
++}
++
++}  // namespace rex::audio
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..f1432e4 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,7 +11,9 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstdio>
+ #include <cstring>
++#include <string>
+ 
+ #include <rex/assert.h>
+ #include <rex/audio/conversion.h>
+@@ -25,6 +27,9 @@
+ #include <SDL3/SDL.h>
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
++REXCVAR_DEFINE_STRING(audio_dump_file, "", "Audio",
++                      "Debug: append every submitted guest frame (6 planar channels x 256 "
++                      "big-endian float samples, 48 kHz) to this file");
+ 
+ namespace rex::audio::sdl {
+ 
+@@ -124,6 +129,14 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+ 
+   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
+ 
++  static FILE* dump_file = [] {
++    std::string path = REXCVAR_GET(audio_dump_file);
++    return path.empty() ? nullptr : std::fopen(path.c_str(), "wb");
++  }();
++  if (dump_file) {
++    std::fwrite(input_frame, sizeof(float), frame_samples_, dump_file);
++  }
++
+   static uint32_t sdl_submit_count = 0;
+   if (sdl_submit_count < 10) {
+     REXAPU_DEBUG("SDLAudioDriver::SubmitFrame: frame_ptr={:08X} queued_count={}", frame_ptr,
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index cbdd7f7..711c6e4 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -1501,20 +1501,21 @@ bool build_vupkd3d128(BuilderContext& ctx) {
+     {
+       auto vSrc = ctx.v(ctx.insn.operands[1]);
+       auto vDst = ctx.v(ctx.insn.operands[0]);
+-      // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in 64 bits
+-      // x, y, z --> floats, w --> float
+-      ctx.println("\t{}.u64[0] = {}.u64[1];", ctx.v_temp(), vSrc);
+-      // x (bits 0-19) - sign extend from 20 bits
+-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 44) >> 44);", ctx.temp(), ctx.v_temp());
+-      ctx.println("\t{}.f32[0] = float({}.s32);", vDst, ctx.temp());
+-      // y (bits 20-39) - sign extend from 20 bits
+-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 24) >> 44);", ctx.temp(), ctx.v_temp());
+-      ctx.println("\t{}.f32[1] = float({}.s32);", vDst, ctx.temp());
+-      // z (bits 40-59) - sign extend from 20 bits
+-      ctx.println("\t{}.s32 = (int32_t({}.u64[0] << 4) >> 44);", ctx.temp(), ctx.v_temp());
+-      ctx.println("\t{}.f32[2] = float({}.s32);", vDst, ctx.temp());
+-      // w (bits 60-63) - 4 bits
+-      ctx.println("\t{}.f32[3] = float({}.u64[0] >> 60);", vDst, ctx.v_temp());
++      // Format: w(4 bits):z(20 bits):y(20 bits):x(20 bits) in guest elements 2-3 (host u64[0]).
++      // x, y, z --> 3.0+X form (signed 20-bit, the most negative value gives a quiet NaN),
++      // w --> 1.0+w form, like NORMPACKED32.
++      // Output: x --> guest element 0 (host u32[3]), y --> host u32[2], z --> host u32[1],
++      //         w --> guest element 3 (host u32[0]).
++      ctx.println("\t{}.u64[0] = {}.u64[0];", ctx.v_temp(), vSrc);
++      constexpr int shifts[] = {44, 24, 4};
++      for (int i = 0; i < 3; i++) {
++        ctx.println("\t{}.s32 = int32_t(int64_t({}.u64[0] << {}) >> 44);", ctx.temp(),
++                    ctx.v_temp(), shifts[i]);
++        ctx.println("\t{}.u32[{}] = {}.s32 == -0x80000 ? 0x7FC00000 : uint32_t({}.s32 + "
++                    "0x40400000);",
++                    vDst, 3 - i, ctx.temp(), ctx.temp());
++      }
++      ctx.println("\t{}.u32[0] = uint32_t({}.u64[0] >> 60) + 0x3F800000;", vDst, ctx.v_temp());
+       break;
+     }
+ 
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..faff03b 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -12,6 +12,9 @@
+ #include <algorithm>
+ #include <cstdarg>
+ #include <cstring>
++#include <string>
++#include <cstdlib>
++#include <chrono>
+ #include <sstream>
+ #include <utility>
+ 
+@@ -43,12 +46,30 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(gpu_debug_log_frame_ms, 0, "GPU/Debug",
++                     "Debug: log every draw and resolve of the first frame that starts this many "
++                     "milliseconds after startup, and one more 10 s later (0 = off)");
++REXCVAR_DEFINE_STRING(gpu_debug_skip_draws, "", "GPU/Debug",
++                      "Debug: skip draws of every frame by index range 'first-last', or by "
++                      "pixel shader hash 'ps:<hex>'")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ namespace rex::graphics::d3d12 {
+ 
++namespace {
++// State for gpu_debug_log_frame_ms / gpu_debug_skip_draws.
++struct GpuDebugState {
++  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++  uint32_t draw_index = 0;
++  bool logging = false;
++  int logged = 0;  // frames logged so far (two: at the given time and 10 s later)
++} g_gpu_debug;
++}  // namespace
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/apply_gamma_pwl_cs.h"
+@@ -1897,6 +1918,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
++  if (g_gpu_debug.logging) {
++    REXGPU_INFO("gpudbg: swap after {} draws", g_gpu_debug.draw_index);
++    g_gpu_debug.logging = false;
++    ++g_gpu_debug.logged;
++  } else if (int32_t log_ms = REXCVAR_GET(gpu_debug_log_frame_ms); log_ms > 0 &&
++                                                                  g_gpu_debug.logged < 2) {
++    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
++        std::chrono::steady_clock::now() - g_gpu_debug.start);
++    g_gpu_debug.logging = elapsed.count() >= log_ms + g_gpu_debug.logged * 10000;
++    if (g_gpu_debug.logging) {
++      REXGPU_INFO("gpudbg: frame at {} ms", elapsed.count());
++    }
++  }
++  g_gpu_debug.draw_index = 0;
++
+   if (!graphics_system_)
+     return;
+   ui::Presenter* presenter = graphics_system_->presenter();
+@@ -2327,6 +2363,49 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+ 
++  {
++    uint32_t draw_index = g_gpu_debug.draw_index++;
++    uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
++    if (g_gpu_debug.logging) {
++      REXGPU_INFO(
++          "gpudbg: draw {} prim {} count {} vs {:016X} ps {:016X} surf {:08X} color {:08X} "
++          "{:08X} depth {:08X} mask {:08X} depthctl {:08X} blend0 {:08X} mode {:08X} "
++          "colorctl {:08X} vp {:g} {:g} {:g} {:g}",
++          draw_index, uint32_t(primitive_type), index_count, vertex_shader->ucode_data_hash(),
++          ps_hash, regs[XE_GPU_REG_RB_SURFACE_INFO], regs[XE_GPU_REG_RB_COLOR_INFO],
++          regs[XE_GPU_REG_RB_COLOR1_INFO], regs[XE_GPU_REG_RB_DEPTH_INFO],
++          regs[XE_GPU_REG_RB_COLOR_MASK], regs[XE_GPU_REG_RB_DEPTHCONTROL],
++          regs[XE_GPU_REG_RB_BLENDCONTROL0], regs[XE_GPU_REG_RB_MODECONTROL],
++          regs[XE_GPU_REG_RB_COLORCONTROL], regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
++          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
++          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
++          regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET));
++      // Vertex shader constants c0-c7 (usually the transforms) every 500 draws.
++      if (draw_index % 500 == 0) {
++        for (uint32_t c = 0; c < 8; ++c) {
++          const float* v =
++              reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + c * 4]);
++          REXGPU_INFO("gpudbg:   c{} = {:g} {:g} {:g} {:g}", c, v[0], v[1], v[2], v[3]);
++        }
++      }
++    }
++    const std::string skip = REXCVAR_GET(gpu_debug_skip_draws);
++    if (!skip.empty()) {
++      if (skip.rfind("ps:", 0) == 0) {
++        if (ps_hash == std::strtoull(skip.c_str() + 3, nullptr, 16)) {
++          return true;
++        }
++      } else {
++        char* end = nullptr;
++        unsigned long first = std::strtoul(skip.c_str(), &end, 10);
++        unsigned long last = *end == '-' ? std::strtoul(end + 1, nullptr, 10) : first;
++        if (draw_index >= first && draw_index <= last) {
++          return true;
++        }
++      }
++    }
++  }
++
+   if (!BeginSubmission(true)) {
+     return false;
+   }
+@@ -2877,6 +2956,16 @@ bool D3D12CommandProcessor::IssueCopy() {
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  if (g_gpu_debug.logging) {
++    const RegisterFile& regs = *register_file_;
++    REXGPU_INFO(
++        "gpudbg: resolve after draw {} surf {:08X} color {:08X} depth {:08X} copyctl {:08X} "
++        "dest base {:08X} pitch {:08X} info {:08X}",
++        g_gpu_debug.draw_index, regs[XE_GPU_REG_RB_SURFACE_INFO], regs[XE_GPU_REG_RB_COLOR_INFO],
++        regs[XE_GPU_REG_RB_DEPTH_INFO], regs[XE_GPU_REG_RB_COPY_CONTROL],
++        regs[XE_GPU_REG_RB_COPY_DEST_BASE], regs[XE_GPU_REG_RB_COPY_DEST_PITCH],
++        regs[XE_GPU_REG_RB_COPY_DEST_INFO]);
++  }
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index a5e9088..72e63e5 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -9,8 +9,15 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdlib>
++#include <cstring>
++
++#include <rex/audio/audio_system.h>
++#include <rex/audio/media_player.h>
+ #include <rex/kernel/xam/apps/xmp_app.h>
+ #include <rex/logging.h>
++#include <rex/runtime.h>
++#include <rex/string.h>
+ #include <rex/system/xthread.h>
+ #include <rex/thread.h>
+ 
+@@ -22,6 +29,19 @@ using namespace rex::system::xam;
+ namespace apps {
+ using namespace rex::system;
+ 
++namespace {
++
++audio::AudioSystem* GetAudioSystem(KernelState* kernel_state) {
++  return static_cast<audio::AudioSystem*>(kernel_state->emulator()->audio_system());
++}
++
++audio::MediaPlayer* GetMediaPlayer(KernelState* kernel_state) {
++  auto* audio_system = GetAudioSystem(kernel_state);
++  return audio_system ? audio_system->media_player() : nullptr;
++}
++
++}  // namespace
++
+ XmpApp::XmpApp(KernelState* kernel_state)
+     : App(kernel_state, 0xFA),
+       state_(State::kIdle),
+@@ -129,25 +149,114 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
+     playlist = it->second;
+   }
+ 
+-  if (playback_client_ == PlaybackClient::kSystem) {
+-    REXKRNL_WARN("XMPPlayTitlePlaylist: System playback is enabled!");
+-    return X_E_SUCCESS;
++  if (playlist->songs.empty()) {
++    return X_E_FAIL;
+   }
+ 
+-  // Start playlist?
+-  REXKRNL_WARN("Playlist playback not supported");
+-  active_playlist_ = playlist;
+-  active_song_index_ = 0;
+-  state_ = State::kPlaying;
+-  OnStateChanged();
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    active_playlist_ = playlist;
++    played_.assign(playlist->songs.size(), false);
++    active_song_index_ = 0;
++    bool found = false;
++    for (size_t i = 0; song_handle && i < playlist->songs.size(); ++i) {
++      if (playlist->songs[i]->handle == song_handle) {
++        active_song_index_ = int(i);
++        found = true;
++        break;
++      }
++    }
++    if (!found && playback_mode_ == PlaybackMode::kShuffle) {
++      active_song_index_ = std::rand() % int(playlist->songs.size());
++    }
++    PlayActiveSong();
++  }
+   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+   return X_E_SUCCESS;
+ }
+ 
++void XmpApp::PlayActiveSong() {
++  auto& song = active_playlist_->songs[active_song_index_];
++  played_[active_song_index_] = true;
++  uint64_t play_id = ++play_id_;
++  std::string path = rex::string::to_utf8(song->file_path);
++
++  std::vector<uint8_t> data;
++  auto entry = kernel_state_->file_system()->ResolvePath(path);
++  rex::filesystem::File* file = nullptr;
++  if (entry && XSUCCEEDED(entry->Open(rex::filesystem::FileAccess::kGenericRead, &file))) {
++    data.resize(entry->size());
++    size_t bytes_read = 0;
++    if (XFAILED(file->ReadSync(std::span<uint8_t>(data), 0, &bytes_read))) {
++      bytes_read = 0;
++    }
++    data.resize(bytes_read);
++    file->Destroy();
++  }
++  if (data.empty()) {
++    REXKRNL_WARN("XMP: cannot read song {}", path);
++  } else {
++    REXKRNL_INFO("XMP: playing {}", path);
++  }
++
++  if (auto* player = GetMediaPlayer(kernel_state_)) {
++    player->SetVolume(volume_);
++    player->Play(std::move(data), [this, play_id] { OnSongFinished(play_id); });
++  }
++  state_ = State::kPlaying;
++  OnStateChanged();
++}
++
++bool XmpApp::AdvanceSong() {
++  size_t count = active_playlist_->songs.size();
++  size_t remaining = 0;
++  for (size_t i = 0; i < count; ++i) {
++    remaining += played_[i] ? 0 : 1;
++  }
++  if (!remaining) {
++    if (repeat_mode_ == RepeatMode::kNoRepeat) {
++      return false;
++    }
++    played_.assign(count, false);
++    remaining = count;
++  }
++  if (playback_mode_ == PlaybackMode::kShuffle) {
++    size_t pick = size_t(std::rand()) % remaining;
++    for (size_t i = 0; i < count; ++i) {
++      if (!played_[i] && pick-- == 0) {
++        active_song_index_ = int(i);
++        break;
++      }
++    }
++  } else {
++    active_song_index_ = int((size_t(active_song_index_) + 1) % count);
++  }
++  return true;
++}
++
++// Called on the media player thread when a song has played to its end.
++void XmpApp::OnSongFinished(uint64_t play_id) {
++  auto global_lock = global_critical_region_.Acquire();
++  if (play_id != play_id_ || !active_playlist_) {
++    return;  // Stopped or replaced meanwhile.
++  }
++  if (AdvanceSong()) {
++    PlayActiveSong();
++  } else {
++    active_playlist_ = nullptr;
++    active_song_index_ = 0;
++    state_ = State::kIdle;
++    OnStateChanged();
++  }
++}
++
+ X_HRESULT XmpApp::XMPContinue() {
+   REXKRNL_DEBUG("XMPContinue()");
+   if (state_ == State::kPaused) {
+     state_ = State::kPlaying;
++    if (auto* player = GetMediaPlayer(kernel_state_)) {
++      player->Resume();
++    }
+   }
+   OnStateChanged();
+   return X_E_SUCCESS;
+@@ -156,9 +265,16 @@ X_HRESULT XmpApp::XMPContinue() {
+ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
+   assert_zero(unk);
+   REXKRNL_DEBUG("XMPStop({:08X})", unk);
+-  active_playlist_ = nullptr;  // ?
+-  active_song_index_ = 0;
+-  state_ = State::kIdle;
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    ++play_id_;
++    active_playlist_ = nullptr;
++    active_song_index_ = 0;
++    state_ = State::kIdle;
++  }
++  if (auto* player = GetMediaPlayer(kernel_state_)) {
++    player->Stop();
++  }
+   OnStateChanged();
+   return X_E_SUCCESS;
+ }
+@@ -167,6 +283,9 @@ X_HRESULT XmpApp::XMPPause() {
+   REXKRNL_DEBUG("XMPPause()");
+   if (state_ == State::kPlaying) {
+     state_ = State::kPaused;
++    if (auto* player = GetMediaPlayer(kernel_state_)) {
++      player->Pause();
++    }
+   }
+   OnStateChanged();
+   return X_E_SUCCESS;
+@@ -177,9 +296,12 @@ X_HRESULT XmpApp::XMPNext() {
+   if (!active_playlist_) {
+     return X_E_NOTFOUND;
+   }
+-  state_ = State::kPlaying;
+-  active_song_index_ = (active_song_index_ + 1) % active_playlist_->songs.size();
+-  OnStateChanged();
++  auto global_lock = global_critical_region_.Acquire();
++  if (!AdvanceSong()) {
++    played_.assign(active_playlist_->songs.size(), false);
++    AdvanceSong();
++  }
++  PlayActiveSong();
+   return X_E_SUCCESS;
+ }
+ 
+@@ -188,13 +310,13 @@ X_HRESULT XmpApp::XMPPrevious() {
+   if (!active_playlist_) {
+     return X_E_NOTFOUND;
+   }
+-  state_ = State::kPlaying;
++  auto global_lock = global_critical_region_.Acquire();
+   if (!active_song_index_) {
+     active_song_index_ = static_cast<int>(active_playlist_->songs.size()) - 1;
+   } else {
+     --active_song_index_;
+   }
+-  OnStateChanged();
++  PlayActiveSong();
+   return X_E_SUCCESS;
+ }
+ 
+@@ -298,6 +420,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       assert_true(args->xmp_client == 0x00000002);
+       REXKRNL_DEBUG("XMPSetVolume({:g})", float(args->value));
+       volume_ = args->value;
++      if (auto* player = GetMediaPlayer(kernel_state_)) {
++        player->SetVolume(volume_);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x0007000D: {
+@@ -343,21 +468,28 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       auto info = memory_->TranslateVirtual(args->info_ptr);
+       assert_true(args->xmp_client == 0x00000002);
+       assert_zero(args->unk_ptr);
+-      REXKRNL_ERROR("XMPGetInfo?({:08X}, {:08X})", uint32_t(args->unk_ptr),
++      REXKRNL_DEBUG("XMPGetCurrentSong({:08X}, {:08X})", uint32_t(args->unk_ptr),
+                     uint32_t(args->info_ptr));
+       if (!active_playlist_) {
+         return X_E_FAIL;
+       }
++      // XMP_SONGINFO: handle, file path (286 wide chars), then five metadata
++      // strings of 40 wide chars each, track number, duration and format.
+       auto& song = active_playlist_->songs[active_song_index_];
++      constexpr size_t kMetadataChars = 40;
++      constexpr size_t kMetadataBase = 4 + 572;
++      std::memset(info, 0, kMetadataBase + kMetadataChars * 2 * 5 + 12);
+       memory::store_and_swap<uint32_t>(info + 0, song->handle);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 0, song->name);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 40, song->artist);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 80, song->album);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 120, song->album_artist);
+-      memory::store_and_swap<std::u16string>(info + 4 + 572 + 160, song->genre);
+-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 200, song->track_number);
+-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 204, song->duration_ms);
+-      memory::store_and_swap<uint32_t>(info + 4 + 572 + 208, static_cast<uint32_t>(song->format));
++      const std::u16string* fields[] = {&song->name, &song->artist, &song->album,
++                                        &song->album_artist, &song->genre};
++      for (size_t i = 0; i < 5; ++i) {
++        memory::store_and_swap<std::u16string>(info + kMetadataBase + i * kMetadataChars * 2,
++                                               fields[i]->substr(0, kMetadataChars - 1));
++      }
++      uint8_t* tail = info + kMetadataBase + kMetadataChars * 2 * 5;
++      memory::store_and_swap<uint32_t>(tail + 0, song->track_number);
++      memory::store_and_swap<uint32_t>(tail + 4, song->duration_ms);
++      memory::store_and_swap<uint32_t>(tail + 8, static_cast<uint32_t>(song->format));
+       return X_E_SUCCESS;
+     }
+     case 0x00070013: {
+@@ -461,10 +593,21 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       return X_E_SUCCESS;
+     }
+     case 0x0007003D: {
+-      // XMPCaptureOutput - not sure how this works :/
+-      REXKRNL_DEBUG("XMPCaptureOutput(...)");
+-      assert_always("XMP output not unimplemented");
+-      return X_E_FAIL;
++      // XMPCaptureOutput: the title mixes the music itself. The callback gets
++      // a buffer of 256 stereo float samples (48 kHz) per audio frame.
++      struct {
++        rex::be<uint32_t> xmp_client;
++        rex::be<uint32_t> callback;
++        rex::be<uint32_t> context;
++        rex::be<uint32_t> title_render;
++      }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
++      static_assert_size(decltype(*args), 16);
++      REXKRNL_DEBUG("XMPCaptureOutput({:08X}, {:08X}, {:08X})", uint32_t(args->callback),
++                    uint32_t(args->context), uint32_t(args->title_render));
++      if (auto* audio_system = GetAudioSystem(kernel_state_)) {
++        audio_system->SetMusicCapture(args->callback, args->context);
++      }
++      return X_E_SUCCESS;
+     }
+   }
+   REXKRNL_ERROR(
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..7ba3bd5 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -12,6 +12,7 @@
+ #include <rex/kernel/xam/module.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
++#include <rex/system/flags.h>
+ #include <rex/hook.h>
+ #include <rex/types.h>
+ #include <rex/string.h>
+@@ -183,19 +184,9 @@ u32 XGetGameRegion_entry() {
+ }
+ 
+ u32 XGetLanguage_entry() {
+-  auto desired_language = XLanguage::kEnglish;
+-
+-  // Switch the language based on game region.
+-  // TODO(benvanik): pull from xex header.
+-  uint32_t game_region = XEX_REGION_NTSCU;
+-  if (game_region & XEX_REGION_NTSCU) {
+-    desired_language = XLanguage::kEnglish;
+-  } else if (game_region & XEX_REGION_NTSCJ) {
+-    desired_language = XLanguage::kJapanese;
+-  }
+-  // Add more overrides?
+-
+-  return uint32_t(desired_language);
++  // Same source as XCONFIG_USER_LANGUAGE so titles that ask either way agree.
++  uint32_t language = REXCVAR_GET(user_language);
++  return language ? language : uint32_t(XLanguage::kEnglish);
+ }
+ 
+ u32 XamGetCurrentTitleId_entry() {
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp b/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
+index a84b5f5..dee9ace 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_audio_xma.cpp
+@@ -191,7 +191,8 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
+   return 0;
+ }
+ 
+-u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
++// The title passes an XMA_LOOP_DATA, not a context image.
++u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_LOOP_DATA> loop_data) {
+   XMA_CONTEXT_DATA context(context_ptr);
+ 
+   context.loop_start = loop_data->loop_start;
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..0922f3b 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -695,6 +695,50 @@ if(WIN32)
+     target_link_libraries(libavcodec PRIVATE bcrypt)
+ endif()
+ 
++# libavformat - demuxers for the XMP music player (ASF/WMA and MP3 files)
++add_library(libavformat STATIC
++    ${FFMPEG_DIR}/libavformat/allformats.c
++    ${FFMPEG_DIR}/libavformat/avio.c
++    ${FFMPEG_DIR}/libavformat/aviobuf.c
++    ${FFMPEG_DIR}/libavformat/dump.c
++    ${FFMPEG_DIR}/libavformat/format.c
++    ${FFMPEG_DIR}/libavformat/id3v1.c
++    ${FFMPEG_DIR}/libavformat/id3v2.c
++    ${FFMPEG_DIR}/libavformat/metadata.c
++    ${FFMPEG_DIR}/libavformat/mux.c
++    ${FFMPEG_DIR}/libavformat/options.c
++    ${FFMPEG_DIR}/libavformat/os_support.c
++    ${FFMPEG_DIR}/libavformat/protocols.c
++    ${FFMPEG_DIR}/libavformat/riff.c
++    ${FFMPEG_DIR}/libavformat/sdp.c
++    ${FFMPEG_DIR}/libavformat/url.c
++    ${FFMPEG_DIR}/libavformat/utils.c
++    ${FFMPEG_DIR}/libavformat/riffdec.c
++    ${FFMPEG_DIR}/libavformat/asfdec_f.c
++    ${FFMPEG_DIR}/libavformat/asf.c
++    ${FFMPEG_DIR}/libavformat/asfcrypt.c
++    ${FFMPEG_DIR}/libavformat/avlanguage.c
++    ${FFMPEG_DIR}/libavformat/mp3dec.c
++    ${FFMPEG_DIR}/libavformat/replaygain.c
++    ${FFMPEG_DIR}/libavformat/file.c
++)
++if(WIN32)
++    target_sources(libavformat PRIVATE ${FFMPEG_DIR}/libavformat/file_open.c)
++endif()
++target_include_directories(libavformat
++    PUBLIC
++        $<BUILD_INTERFACE:${FFMPEG_DIR}>
++        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
++    PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
++)
++target_compile_definitions(libavformat PRIVATE ${FFMPEG_COMMON_DEFINES})
++target_compile_options(libavformat PRIVATE -w)
++target_link_libraries(libavformat PUBLIC libavcodec libavutil)
++set_target_properties(libavformat PROPERTIES
++    C_VISIBILITY_PRESET hidden
++    VISIBILITY_INLINES_HIDDEN ON
++    FOLDER "FFmpeg")
++
+ # Hidden visibility is required on aarch64. The NEON .S files use ADRP/ADD
+ # PC-relative addressing (movrel) for symbols like ff_cos_*, which the linker
+ # only accepts against locally bound symbols when emitting a shared object.

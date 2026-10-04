@@ -1,0 +1,22 @@
+# Never commit anything derived from a game disc.
+*.iso
+*.xex
+*.pe
+titles/
+assets
+generated/*
+!generated/rexglue.cmake
+
+# Build output
+out/
+build*/
+__pycache__/
+*.log
+pgr3_crash.txt
+pgr3_debug.txt
+pgr3_launcher.toml
+frames/
+*.raw
+*.wav
+*.bmp
+CMakeUserPresets.json
